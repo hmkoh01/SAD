@@ -16,7 +16,7 @@ import {
 } from 'recharts';
 import './styles.css';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = '/api';
 
 const ASIL_COLORS = {
   QM: '#64748b',
@@ -62,9 +62,201 @@ const DASHBOARD_INFO = {
   draftReport: 'Draft ISO 26262 Compliance Report presents generated report text based on traceability mappings, simulation outputs, anomaly review, and engineer decisions. It remains draft evidence until final approval.',
 };
 
-const formatPercent = (value) => `${Number(value || 0).toFixed(1)}%`;
-const formatConfidence = (value) => `${(Number(value || 0) * 100).toFixed(1)}%`;
-const formatHours = (minutes) => `${(Number(minutes || 0) / 60).toFixed(1)} h`;
+const formatPercent = (value) => `${Number(value ?? 0).toFixed(1)}%`;
+const formatConfidence = (value) => `${(Number(value ?? 0) * 100).toFixed(1)}%`;
+const formatHours = (minutes) => `${(Number(minutes ?? 0) / 60).toFixed(1)} h`;
+
+const ASIL_ORDER = ['QM', 'A', 'B', 'C', 'D'];
+
+const getRequirementIdFromRow = (row) => (
+  row?.requirement_id ??
+  row?.requirementId ??
+  row?.RequirementID ??
+  row?.requirementID ??
+  row?.requirement_id_raw ??
+  row?.requirementIdRaw
+);
+
+const getTestCaseIdFromRow = (row) => (
+  row?.matched_test_case_id ??
+  row?.testCaseId ??
+  row?.test_case_id ??
+  row?.matchedTestCaseId
+);
+
+const getAsilFromRow = (row) => String(row?.asil_level ?? row?.asilLevel ?? 'QM').toUpperCase();
+const getMatchScoreFromRow = (row) => Number(row?.match_score ?? row?.confidence ?? row?.final_match_score ?? 0);
+const getTestDurationFromRow = (row) => Number(row?.test_duration_minutes ?? row?.durationMinutes ?? row?.estimatedDurationMinutes ?? 0);
+const getCoverageTypeFromRow = (row) => String(row?.coverage_type ?? row?.coverageType ?? '').toLowerCase();
+
+const isMappingReviewRequiredRow = (row) => {
+  const reviewStatus = String(row?.reviewStatus ?? row?.review_status ?? '').toUpperCase();
+  const mappingReviewStatus = String(row?.mappingReviewStatus ?? row?.mapping_review_status ?? '').toUpperCase();
+  return (
+    reviewStatus === 'MANUAL_REVIEW_REQUIRED' ||
+    reviewStatus === 'REVIEW_REQUIRED' ||
+    reviewStatus === 'WEAK_FALLBACK' ||
+    reviewStatus === 'EXTERNAL_VALIDATION_REQUIRED' ||
+    mappingReviewStatus === 'MAPPING_REVIEW_REQUIRED'
+  );
+};
+
+function normalizeSummary(rawSummary = {}, activeSummary = {}, activeMatches = [], activeReviewItems = []) {
+  const requirementIds = new Set(activeMatches.map(getRequirementIdFromRow).filter(Boolean));
+  const uniqueTests = new Map();
+  activeMatches.forEach((row) => {
+    const testCaseId = getTestCaseIdFromRow(row);
+    if (testCaseId && !uniqueTests.has(testCaseId)) uniqueTests.set(testCaseId, row);
+  });
+
+  const rawRequirementsUploaded = Number(
+    activeSummary.requirementsUploaded ??
+    rawSummary.requirementsUploaded ??
+    rawSummary.totalRequirements ??
+    rawSummary.requirementCount ??
+    requirementIds.size
+  );
+  const totalRequirements = Number(activeSummary.totalRequirements ?? activeSummary.requirementCount ?? requirementIds.size);
+  const mappingCount = Number(activeSummary.mappingCount ?? activeSummary.requirementTestMappings ?? activeMatches.length);
+  const uniqueTestCases = Number(activeSummary.uniqueTestCases ?? activeSummary.uniqueTestCaseCount ?? uniqueTests.size);
+  const totalTestTimeMinutes = Number(
+    activeSummary.totalTestTimeMinutes ??
+    activeSummary.estimatedTestTimeMinutes ??
+    activeSummary.totalEstimatedTestTimeMinutes ??
+    Array.from(uniqueTests.values()).reduce((sum, row) => sum + getTestDurationFromRow(row), 0)
+  );
+  const reviewRequirementIds = new Set(activeReviewItems.map(getRequirementIdFromRow).filter(Boolean));
+  const reviewNeeded = Number(
+    activeSummary.reviewNeeded ??
+    activeSummary.reviewNeededCount ??
+    activeSummary.reviewNeededRequirements ??
+    reviewRequirementIds.size
+  );
+  const averageConfidence = Number(
+    activeSummary.averageConfidence ??
+    activeSummary.avgMatchScore ??
+    (activeMatches.length
+      ? activeMatches.reduce((sum, row) => sum + getMatchScoreFromRow(row), 0) / activeMatches.length
+      : 0)
+  );
+
+  const requirementAsil = new Map();
+  activeMatches.forEach((row) => {
+    const requirementId = getRequirementIdFromRow(row);
+    if (requirementId) requirementAsil.set(requirementId, getAsilFromRow(row));
+  });
+  const requirementCountsByAsil = ASIL_ORDER.map((asilLevel) => ({
+    asilLevel,
+    count: Array.from(requirementAsil.values()).filter((level) => level === asilLevel).length,
+  }));
+  const reviewNeededByAsil = ASIL_ORDER.map((asilLevel) => ({
+    asilLevel,
+    reviewNeeded: new Set(
+      activeReviewItems.filter((row) => getAsilFromRow(row) === asilLevel).map(getRequirementIdFromRow).filter(Boolean)
+    ).size,
+  }));
+  const coverageByAsil = requirementCountsByAsil.map(({ asilLevel, count }) => {
+    const rawCount = Number((rawSummary.requirementCountsByAsil ?? rawSummary.asilCounts ?? [])
+      .find((item) => item.asilLevel === asilLevel)?.count ?? count);
+    return {
+      asilLevel,
+      requirements: rawCount,
+      covered: count,
+      coverageRate: rawCount > 0 ? Math.round((count / rawCount) * 1000) / 10 : 0,
+    };
+  });
+  const estimatedTestTimeByAsil = ASIL_ORDER.map((asilLevel) => ({
+    asilLevel,
+    estimatedMinutes: Array.from(uniqueTests.values())
+      .filter((row) => getAsilFromRow(row) === asilLevel)
+      .reduce((sum, row) => sum + getTestDurationFromRow(row), 0),
+  }));
+  const testTypeCounts = Array.from(uniqueTests.values()).reduce((counts, row) => {
+    const testType = String(row?.test_type ?? row?.testType ?? 'Unknown');
+    const existing = counts.find((item) => item.testType === testType);
+    if (existing) existing.count += 1;
+    else counts.push({ testType, count: 1 });
+    return counts;
+  }, []);
+  const confidenceDistribution = [
+    { label: 'High (>= 0.80)', status: 'good', count: activeMatches.filter((row) => getMatchScoreFromRow(row) >= 0.8).length },
+    { label: 'Medium (0.65-0.79)', status: 'warning', count: activeMatches.filter((row) => getMatchScoreFromRow(row) >= 0.65 && getMatchScoreFromRow(row) < 0.8).length },
+    { label: 'Low (< 0.65)', status: 'danger', count: activeMatches.filter((row) => getMatchScoreFromRow(row) < 0.65).length },
+  ];
+  const reviewItems = activeReviewItems.map((row) => ({
+    requirementId: getRequirementIdFromRow(row),
+    asilLevel: getAsilFromRow(row),
+    matchedTestCaseId: getTestCaseIdFromRow(row),
+    matchedTestCaseName: row?.matched_test_case_name ?? row?.testCaseName ?? row?.generatedCandidateTestCase?.testCaseName ?? 'Pending verification evidence',
+    confidence: getMatchScoreFromRow(row),
+    action: getCoverageTypeFromRow(row) === 'external_validation_required' ? 'External Validation' : 'Manual Review',
+  }));
+  const longestTests = Array.from(uniqueTests.values())
+    .map((row) => ({
+      testCaseId: getTestCaseIdFromRow(row),
+      testCaseName: row?.matched_test_case_name ?? row?.testCaseName ?? 'Unnamed test case',
+      testType: row?.test_type ?? row?.testType ?? 'Unknown',
+      durationMinutes: getTestDurationFromRow(row),
+    }))
+    .sort((a, b) => b.durationMinutes - a.durationMinutes)
+    .slice(0, 10);
+  const highRiskRequirementCount = new Set(
+    activeMatches.filter((row) => ['C', 'D'].includes(getAsilFromRow(row))).map(getRequirementIdFromRow).filter(Boolean)
+  ).size;
+  const coverageRate = Number(
+    activeSummary.coverageRate ??
+    (rawRequirementsUploaded > 0 ? Math.round((totalRequirements / rawRequirementsUploaded) * 1000) / 10 : 0)
+  );
+  const testReuseRatio = Number(
+    activeSummary.testReuseRatio ??
+    (uniqueTestCases > 0 ? Math.round((mappingCount / uniqueTestCases) * 100) / 100 : 0)
+  );
+  const highestAsilLevel = [...ASIL_ORDER].reverse().find((level) => requirementCountsByAsil.find((row) => row.asilLevel === level)?.count > 0) ?? 'N/A';
+  const executiveSummary = (
+    `${totalRequirements} of ${rawRequirementsUploaded} uploaded requirements are currently eligible for active evidence, ` +
+    `using ${uniqueTestCases} unique test cases and ${mappingCount} active mappings. ` +
+    `${reviewNeeded} requirement(s) remain visible in the review queue.`
+  );
+
+  return {
+    ...rawSummary,
+    ...activeSummary,
+    rawRequirementsUploaded,
+    requirementsUploaded: totalRequirements,
+    totalRequirements,
+    requirementCount: totalRequirements,
+    requirementTestMappings: mappingCount,
+    mappingCount,
+    uniqueTestCases,
+    uniqueTestCaseCount: uniqueTestCases,
+    totalTestTimeMinutes,
+    estimatedTestTimeMinutes: totalTestTimeMinutes,
+    totalEstimatedTestTimeMinutes: totalTestTimeMinutes,
+    reviewNeededRequirements: reviewNeeded,
+    reviewNeeded,
+    reviewNeededCount: reviewNeeded,
+    highRiskRequirementCount,
+    highRiskRequirements: highRiskRequirementCount,
+    averageConfidence,
+    avgMatchScore: averageConfidence,
+    averageMatchScore: averageConfidence,
+    coverageRate,
+    testReuseRatio,
+    highestAsilLevel,
+    requirementCountsByAsil,
+    asilCounts: requirementCountsByAsil,
+    testTypeCounts,
+    coverageByAsil,
+    estimatedTestTimeByAsil,
+    reviewNeededByAsil,
+    confidenceDistribution,
+    reviewItems,
+    longestTests,
+    requirementsFullyCovered: totalRequirements,
+    uncoveredRequirements: Math.max(rawRequirementsUploaded - totalRequirements, 0),
+    executiveSummary,
+  };
+}
 
 const MAPPING_REVIEW_REASON_LABELS = {
   LOW_MATCH_SCORE: 'Low match score',
@@ -89,10 +281,13 @@ const asilColorClass = (asilLevel) => {
 
 function App() {
   const [selectedFile, setSelectedFile] = React.useState(null);
+  const [isDragging, setIsDragging] = React.useState(false);
   const [uploadStage, setUploadStage] = React.useState('idle');
   const [uploadProgress, setUploadProgress] = React.useState(0);
+  const [uploadElapsedSeconds, setUploadElapsedSeconds] = React.useState(0);
   const [analysis, setAnalysis] = React.useState(null);
   const [uploadError, setUploadError] = React.useState('');
+  const [uploadNotice, setUploadNotice] = React.useState('');
 
   const [testStage, setTestStage] = React.useState('idle');
   const [testProgress, setTestProgress] = React.useState(0);
@@ -116,6 +311,8 @@ function App() {
   const [reviewNotes, setReviewNotes] = React.useState({});
 
   const uploadTimerRef = React.useRef(null);
+  const uploadAbortControllerRef = React.useRef(null);
+  const dragCounterRef = React.useRef(0);
   const testTimerRef = React.useRef(null);
   const reportTimerRef = React.useRef(null);
 
@@ -144,10 +341,104 @@ function App() {
   React.useEffect(() => {
     return () => {
       if (uploadTimerRef.current) clearInterval(uploadTimerRef.current);
+      if (uploadAbortControllerRef.current) uploadAbortControllerRef.current.abort();
       if (testTimerRef.current) clearInterval(testTimerRef.current);
       if (reportTimerRef.current) clearInterval(reportTimerRef.current);
     };
   }, []);
+
+  function validateAndUpload(files) {
+    const fileList = Array.from(files || []);
+    setUploadError('');
+    setUploadNotice('');
+
+    if (fileList.length !== 1) {
+      setUploadError('Please upload exactly one requirements file.');
+      return;
+    }
+
+    const file = fileList[0];
+    const extension = file.name.includes('.') ? `.${file.name.split('.').pop().toLowerCase()}` : '';
+    if (!['.csv', '.xlsx', '.xls'].includes(extension)) {
+      setUploadError('Unsupported file format. Please upload a CSV, XLSX, or XLS file.');
+      return;
+    }
+
+    handleUpload(file);
+  }
+
+  function handleDragEnter(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    dragCounterRef.current += 1;
+    setIsDragging(true);
+  }
+
+  function handleDragOver(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = 'copy';
+    setIsDragging(true);
+  }
+
+  function handleDragLeave(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+    if (dragCounterRef.current === 0) setIsDragging(false);
+  }
+
+  function handleDrop(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    dragCounterRef.current = 0;
+    setIsDragging(false);
+
+    if (uploadStage === 'analyzing' || uploadStage === 'rendering') {
+      setUploadError('An analysis is already in progress. Cancel it before uploading another file.');
+      return;
+    }
+
+    validateAndUpload(event.dataTransfer.files);
+  }
+
+  function startUploadProgressTimer() {
+    const start = Date.now();
+    if (uploadTimerRef.current) clearInterval(uploadTimerRef.current);
+
+    const updateEstimatedProgress = () => {
+      const elapsedSeconds = Math.floor((Date.now() - start) / 1000);
+      let progress;
+
+      if (elapsedSeconds <= 10) {
+        progress = 5 + (elapsedSeconds / 10) * 15;
+      } else if (elapsedSeconds <= 60) {
+        progress = 20 + ((elapsedSeconds - 10) / 50) * 35;
+      } else if (elapsedSeconds <= 180) {
+        progress = 55 + ((elapsedSeconds - 60) / 120) * 30;
+      } else {
+        progress = Math.min(94, 85 + ((elapsedSeconds - 180) / 180) * 9);
+      }
+
+      setUploadElapsedSeconds(elapsedSeconds);
+      setUploadProgress(Math.round(progress));
+    };
+
+    updateEstimatedProgress();
+    uploadTimerRef.current = setInterval(updateEstimatedProgress, 1000);
+  }
+
+  function cancelUpload() {
+    if (uploadAbortControllerRef.current) uploadAbortControllerRef.current.abort();
+    if (uploadTimerRef.current) clearInterval(uploadTimerRef.current);
+    uploadAbortControllerRef.current = null;
+    uploadTimerRef.current = null;
+    setUploadStage('idle');
+    setUploadProgress(0);
+    setUploadElapsedSeconds(0);
+    setUploadError('');
+    setUploadNotice('Analysis was cancelled.');
+  }
 
   async function handleUpload(file) {
     if (!file) return;
@@ -155,6 +446,7 @@ function App() {
     setSelectedFile(file);
     setAnalysis(null);
     setUploadError('');
+    setUploadNotice('');
     setReport(null);
     setReportStage('idle');
     setReportProgress(0);
@@ -169,15 +461,20 @@ function App() {
     setCandidate1RecoveryRecords({});
     setLiveAuditEvents([]);
     appendAuditEvent('File Upload Started', 'User', file.name, 'User selected a requirements file for upload and analysis.');
-    setUploadStage('idle');
-    setUploadProgress(0);
+    setUploadStage('analyzing');
+    setUploadProgress(5);
+    setUploadElapsedSeconds(0);
+    startUploadProgressTimer();
 
     const formData = new FormData();
     formData.append('file', file);
+    const controller = new AbortController();
+    uploadAbortControllerRef.current = controller;
 
     const apiPromise = fetch(`${API_BASE}/analyze`, {
       method: 'POST',
       body: formData,
+      signal: controller.signal,
     }).then(async (response) => {
       const payload = await response.json();
       if (!response.ok) {
@@ -188,43 +485,30 @@ function App() {
 
     try {
       const payload = await apiPromise;
-      setUploadStage('extracting');
-      setUploadProgress(0);
-      await runUploadAnimation();
+      if (uploadTimerRef.current) clearInterval(uploadTimerRef.current);
+      uploadTimerRef.current = null;
+      setUploadStage('rendering');
+      setUploadProgress(100);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      if (controller.signal.aborted) return;
       setAnalysis(payload);
       appendAuditEvent('File Upload Completed', 'System', file.name, 'Requirements file uploaded and backend analysis payload received.');
       setUploadStage('done');
-      setUploadProgress(100);
     } catch (error) {
-      setUploadProgress(0);
-      setUploadError(error.message);
-      setUploadStage('error');
-    }
-  }
-
-  function runUploadAnimation() {
-    return new Promise((resolve) => {
-      const start = Date.now();
       if (uploadTimerRef.current) clearInterval(uploadTimerRef.current);
-
-      uploadTimerRef.current = setInterval(() => {
-        const elapsed = Date.now() - start;
-        const percent = Math.min(100, Math.round((elapsed / 4000) * 100));
-        setUploadProgress(percent);
-
-        if (elapsed < 2000) {
-          setUploadStage('extracting');
-        } else {
-          setUploadStage('matching');
-        }
-
-        if (elapsed >= 4000) {
-          clearInterval(uploadTimerRef.current);
-          uploadTimerRef.current = null;
-          resolve();
-        }
-      }, 100);
-    });
+      uploadTimerRef.current = null;
+      setUploadProgress(0);
+      if (error.name === 'AbortError') {
+        setUploadStage('idle');
+      } else {
+        setUploadError(error.message);
+        setUploadStage('error');
+      }
+    } finally {
+      if (uploadAbortControllerRef.current === controller) {
+        uploadAbortControllerRef.current = null;
+      }
+    }
   }
 
   async function runTests() {
@@ -429,11 +713,14 @@ function App() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        matches: activeMatches,
+        matches: analysis?.matches ?? [],
+        activeMappings: activeMatches,
         decisions,
         candidate1Decisions,
         candidate1ReviewNotes,
         candidate1RecoveryRecords,
+        traceabilityMatrix: analysis?.traceabilityMatrix ?? [],
+        simulationResults: testResults?.results ?? [],
       }),
     }).then(async (response) => {
       const payload = await response.json();
@@ -659,72 +946,92 @@ function App() {
   }
 
 
+  const excludedEvidenceDecisions = new Set([
+    'REJECTED_BY_ENGINEER',
+    'REJECTED_WITH_ALTERNATIVE',
+    'MANUAL_TEST_REQUESTED',
+    'REJECTED_UNTESTABLE',
+  ]);
+  const excludedRecoveryActions = new Set([
+    'KEEP_REJECTED',
+    'KEEP_REJECTED_WITH_NEW_TEST_UPLOAD',
+    'KEEP_REJECTED_UNTESTABLE',
+    'MANUAL_TEST_REQUESTED',
+    'ALTERNATIVE_SELECTED',
+  ]);
+  const excludedEvidenceRequirementIds = new Set(
+    [
+      ...Object.entries(candidate1Decisions)
+        .filter(([, decision]) => excludedEvidenceDecisions.has(String(decision).toUpperCase()))
+        .map(([requirementId]) => requirementId),
+      ...Object.entries(candidate1RecoveryRecords)
+        .filter(([, record]) => excludedRecoveryActions.has(String(record?.recoveryAction).toUpperCase()))
+        .map(([requirementId]) => requirementId),
+    ]
+  );
+  const engineerApprovedRequirementIds = new Set(
+    Object.entries(candidate1Decisions)
+      .filter(([, decision]) => String(decision).toUpperCase() === 'APPROVED_BY_ENGINEER')
+      .map(([requirementId]) => requirementId)
+  );
   const untestableRequirementIds = new Set(
     Object.entries(candidate1RecoveryRecords)
       .filter(([, record]) => record?.recoveryAction === 'KEEP_REJECTED_UNTESTABLE')
       .map(([requirementId]) => requirementId)
   );
-
-  const getRequirementIdFromRow = (row) => (
-    row?.requirement_id ||
-    row?.requirementId ||
-    row?.RequirementID ||
-    row?.requirementID ||
-    row?.requirement_id_raw ||
-    row?.requirementIdRaw
-  );
-
-  const getTestCaseIdFromRow = (row) => (
-    row?.matched_test_case_id ||
-    row?.testCaseId ||
-    row?.test_case_id ||
-    row?.matchedTestCaseId
-  );
-
-  const isUntestableRequirement = (row) => untestableRequirementIds.has(getRequirementIdFromRow(row));
-
-  const activeMatches = (analysis?.matches || []).filter((row) => !isUntestableRequirement(row));
-  const activeTraceabilityMatrix = (analysis?.traceabilityMatrix || []).filter((row) => !isUntestableRequirement(row));
-
-  const activeRequirementIds = new Set(activeMatches.map(getRequirementIdFromRow).filter(Boolean));
-  const activeUniqueTestCaseIds = new Set(activeMatches.map(getTestCaseIdFromRow).filter(Boolean));
-
-  const isMappingReviewRequiredRow = (row) => {
-    const reviewStatus = String(row?.reviewStatus || row?.review_status || '').toUpperCase();
-    const mappingReviewStatus = String(row?.mappingReviewStatus || row?.mapping_review_status || '').toUpperCase();
-    return reviewStatus === 'MANUAL_REVIEW_REQUIRED' || mappingReviewStatus === 'MAPPING_REVIEW_REQUIRED';
-  };
-
-  const activeReviewNeededRequirementIds = new Set(
-    activeTraceabilityMatrix
-      .filter(isMappingReviewRequiredRow)
-      .map(getRequirementIdFromRow)
-      .filter(Boolean)
-  );
-  const activeReviewNeededCount = activeReviewNeededRequirementIds.size;
-
-  const activeEstimatedTestTimeMinutes = Array.from(
+  const allMatches = analysis?.matches ?? [];
+  const activeMatches = allMatches.filter((row) => (
+    !excludedEvidenceRequirementIds.has(getRequirementIdFromRow(row)) &&
+    getCoverageTypeFromRow(row) !== 'external_validation_required' &&
+    String(row?.review_status ?? row?.reviewStatus ?? '').toLowerCase() !== 'external_validation_required'
+  ));
+  // Traceability retains unresolved and external-validation rows so exclusions remain visible and auditable.
+  const activeTraceabilityMatrix = analysis?.traceabilityMatrix ?? [];
+  const candidateReviewItems = analysis?.candidate1ReviewItems ?? [];
+  const traceabilityReviewRows = activeTraceabilityMatrix.filter((row) => (
+    (isMappingReviewRequiredRow(row) && !engineerApprovedRequirementIds.has(getRequirementIdFromRow(row))) ||
+    getCoverageTypeFromRow(row) === 'external_validation_required' ||
+    excludedEvidenceRequirementIds.has(getRequirementIdFromRow(row))
+  ));
+  const candidateDecisionReviewRows = candidateReviewItems.filter((row) => (
+    excludedEvidenceRequirementIds.has(getRequirementIdFromRow(row)) ||
+    (isMappingReviewRequiredRow(row) && !engineerApprovedRequirementIds.has(getRequirementIdFromRow(row)))
+  ));
+  const activeReviewItems = Array.from(
     new Map(
-      activeMatches.map((row) => [
-        getTestCaseIdFromRow(row),
-        Number(row?.test_duration_minutes || row?.durationMinutes || row?.estimatedDurationMinutes || 0),
+      [...traceabilityReviewRows, ...candidateDecisionReviewRows].map((row) => [
+        `${getRequirementIdFromRow(row)}:${getTestCaseIdFromRow(row) ?? 'candidate'}`,
+        row,
       ])
     ).values()
-  ).reduce((sum, minutes) => sum + minutes, 0);
-
-  const activeSummary = analysis?.summary ? {
-    ...analysis.summary,
-    totalRequirements: activeRequirementIds.size || Math.max(0, Number(analysis.summary.totalRequirements || 0) - untestableRequirementIds.size),
-    requirementCount: activeRequirementIds.size || Math.max(0, Number(analysis.summary.requirementCount || analysis.summary.totalRequirements || 0) - untestableRequirementIds.size),
-    uniqueTestCases: activeUniqueTestCaseIds.size || analysis.summary.uniqueTestCases,
-    uniqueTestCaseCount: activeUniqueTestCaseIds.size || analysis.summary.uniqueTestCaseCount,
-    mappingCount: activeMatches.length,
-    reviewNeeded: activeReviewNeededCount,
-    reviewNeededCount: activeReviewNeededCount,
-    estimatedTestTimeMinutes: activeEstimatedTestTimeMinutes || analysis.summary.estimatedTestTimeMinutes,
-    totalEstimatedTestTimeMinutes: activeEstimatedTestTimeMinutes || analysis.summary.totalEstimatedTestTimeMinutes,
-    untestableRequirementCount: untestableRequirementIds.size,
-  } : null;
+  );
+  const activeRequirementIds = new Set(activeMatches.map(getRequirementIdFromRow).filter(Boolean));
+  const activeUniqueTestCaseIds = new Set(activeMatches.map(getTestCaseIdFromRow).filter(Boolean));
+  const activeDurationByTest = new Map();
+  activeMatches.forEach((row) => {
+    const testCaseId = getTestCaseIdFromRow(row);
+    if (testCaseId && !activeDurationByTest.has(testCaseId)) activeDurationByTest.set(testCaseId, getTestDurationFromRow(row));
+  });
+  const activeEstimatedTestTimeMinutes = Array.from(activeDurationByTest.values()).reduce((sum, minutes) => sum + minutes, 0);
+  const activeSummary = analysis?.summary ? normalizeSummary(
+    analysis.summary,
+    {
+      totalRequirements: activeRequirementIds.size,
+      requirementCount: activeRequirementIds.size,
+      uniqueTestCases: activeUniqueTestCaseIds.size,
+      uniqueTestCaseCount: activeUniqueTestCaseIds.size,
+      mappingCount: activeMatches.length,
+      reviewNeeded: new Set(activeReviewItems.map(getRequirementIdFromRow).filter(Boolean)).size,
+      estimatedTestTimeMinutes: activeEstimatedTestTimeMinutes,
+      untestableRequirementCount: untestableRequirementIds.size,
+      excludedEvidenceRequirementCount: excludedEvidenceRequirementIds.size,
+      externalValidationRequiredCount: new Set(
+        allMatches.filter((row) => getCoverageTypeFromRow(row) === 'external_validation_required').map(getRequirementIdFromRow)
+      ).size,
+    },
+    activeMatches,
+    activeReviewItems
+  ) : null;
 
   const combinedAuditLog = [...(analysis?.auditLog || []), ...liveAuditEvents];
   const safeTestSummary = testResults?.summary || {
@@ -741,6 +1048,19 @@ function App() {
   const reviewItems = safeTestResultRows.filter((row) => row.result === 'REVIEW');
   const reviewedItemCount = reviewItems.filter((item) => Boolean(reviewDecisions[item.test_case_id])).length;
   const allReviewItemsCompleted = reviewItems.length > 0 && reviewedItemCount === reviewItems.length;
+  const isAnalyzing = uploadStage === 'analyzing' || uploadStage === 'rendering';
+  const estimatedAnalysisStage = uploadStage === 'rendering'
+    ? 'Rendering results'
+    : uploadElapsedSeconds < 2
+      ? 'Preparing file upload'
+      : uploadElapsedSeconds < 10
+        ? 'Parsing requirements file'
+        : uploadElapsedSeconds < 60
+          ? 'C1 requirement-test mapping in progress'
+          : uploadElapsedSeconds < 150
+            ? 'C2 regression priority calculation in progress'
+            : 'Generating dashboard data';
+  const estimatedRemainingMinutes = Math.max(0, Math.ceil((240 - uploadElapsedSeconds) / 60));
 
   return (
     <main className="page">
@@ -750,37 +1070,77 @@ function App() {
         <p className="address">Frontend: http://127.0.0.1:5173/ · API: http://127.0.0.1:8000/</p>
       </header>
 
-      <section className="card upload-card">
+      <section
+        className={`card upload-card${isDragging ? ' is-dragging' : ''}`}
+        onDragEnter={handleDragEnter}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
         <div className="section-title">
           <Upload size={20} />
           <h2>Requirements Upload</h2>
         </div>
-        <label className="dropzone">
+        <label className={`dropzone${isDragging ? ' is-dragging' : ''}${isAnalyzing ? ' is-disabled' : ''}`}>
           <input
             type="file"
             accept=".csv,.xlsx,.xls"
-            onChange={(event) => handleUpload(event.target.files?.[0])}
+            disabled={isAnalyzing}
+            onChange={(event) => {
+              validateAndUpload(event.target.files);
+              event.target.value = '';
+            }}
           />
-          <strong>Drag and drop or select a requirements file</strong>
+          <strong>{isDragging ? 'Drop the requirements file here' : 'Drag and drop or select a requirements file'}</strong>
           <span>Accepted formats: CSV, XLSX, XLS</span>
         </label>
 
         {selectedFile && <p className="file-name">Selected file: {selectedFile.name}</p>}
 
-        {uploadStage !== 'idle' && uploadStage !== 'error' && (
-          <ProgressBox
-            title={uploadStage === 'extracting' ? 'Extracting requirements...' : uploadStage === 'matching' ? 'Matching requirements with test cases...' : 'Upload processing complete.'}
-            progress={uploadProgress}
-          />
+        {isAnalyzing && (
+          <div className="analysis-progress-card" role="status" aria-live="polite">
+            <div className="analysis-progress-header">
+              <div className="analysis-spinner" aria-hidden="true" />
+              <div>
+                <strong>{estimatedAnalysisStage}</strong>
+                <p>Local AI model analysis is in progress. This may take several minutes.</p>
+              </div>
+            </div>
+            <div className="analysis-progress-meta">
+              <span>Estimated progress</span>
+              <strong>{uploadProgress}%</strong>
+            </div>
+            <div
+              className="progress-shell"
+              role="progressbar"
+              aria-label="Estimated analysis progress"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow={uploadProgress}
+            >
+              <div className="progress-fill" style={{ width: `${uploadProgress}%` }} />
+            </div>
+            <div className="analysis-progress-footer">
+              <span>
+                {uploadElapsedSeconds < 240
+                  ? `Estimated wait: about ${estimatedRemainingMinutes} minute${estimatedRemainingMinutes === 1 ? '' : 's'}`
+                  : 'Analysis is taking longer than estimated.'}
+              </span>
+              <button type="button" className="secondary-button analysis-cancel-button" onClick={cancelUpload}>
+                Cancel analysis
+              </button>
+            </div>
+          </div>
         )}
 
         {uploadError && <div className="error-box">{uploadError}</div>}
+        {uploadNotice && <div className="notice-box">{uploadNotice}</div>}
       </section>
 
       {analysis && (
         <>
           <ParserSummary parserInfo={analysis.parserInfo} />
-          <Dashboard summary={activeSummary || analysis.summary} />
+          <Dashboard summary={activeSummary ?? analysis.summary} />
           <Candidate1ReviewWorkspace
             rows={analysis.candidate1ReviewItems || []}
             decisions={candidate1Decisions}
@@ -2129,14 +2489,14 @@ function ProgressBox({ title, progress }) {
 }
 
 function Dashboard({ summary }) {
-  const requirementCountsByAsil = summary.requirementCountsByAsil || summary.asilCounts || [];
-  const testTypeCounts = summary.testTypeCounts || [];
-  const coverageByAsil = summary.coverageByAsil || [];
-  const estimatedTestTimeByAsil = summary.estimatedTestTimeByAsil || [];
-  const confidenceDistribution = summary.confidenceDistribution || [];
-  const reviewNeededByAsil = summary.reviewNeededByAsil || [];
-  const reviewItems = summary.reviewItems || [];
-  const longestTests = summary.longestTests || [];
+  const requirementCountsByAsil = summary.requirementCountsByAsil ?? summary.asilCounts ?? [];
+  const testTypeCounts = summary.testTypeCounts ?? [];
+  const coverageByAsil = summary.coverageByAsil ?? [];
+  const estimatedTestTimeByAsil = summary.estimatedTestTimeByAsil ?? [];
+  const confidenceDistribution = summary.confidenceDistribution ?? [];
+  const reviewNeededByAsil = summary.reviewNeededByAsil ?? [];
+  const reviewItems = summary.reviewItems ?? [];
+  const longestTests = summary.longestTests ?? [];
   const [activeDashboardGroup, setActiveDashboardGroup] = React.useState('overview');
   const [expandedChartGroups, setExpandedChartGroups] = React.useState({ asil: false, portfolio: false });
 
@@ -2155,7 +2515,7 @@ function Dashboard({ summary }) {
           <p>ISO 26262 AI-assisted requirement-to-test coverage overview</p>
         </div>
         <span className={`asil-badge ${asilColorClass(summary.highestAsilLevel)}`}>
-          Highest ASIL: {summary.highestAsilLevel || 'N/A'}
+          Highest ASIL: {summary.highestAsilLevel ?? 'N/A'}
         </span>
       </div>
 
@@ -2194,13 +2554,13 @@ function Dashboard({ summary }) {
         <div className="dashboard-group-panel">
           <div className="mis-kpi-grid">
             <div className="kpi-card kpi-blue">
-              <div className="kpi-label-row"><span>Total Requirements</span></div>
-              <strong>{summary.requirementsUploaded}</strong>
-              <small>Uploaded software safety requirements</small>
+              <div className="kpi-label-row"><span>Active Evidence Requirements</span></div>
+              <strong>{summary.totalRequirements ?? summary.requirementCount ?? 0}</strong>
+              <small>Requirements currently eligible for active evidence</small>
             </div>
             <div className="kpi-card kpi-purple">
               <div className="kpi-label-row"><span>Unique Test Cases</span></div>
-              <strong>{summary.uniqueTestCases}</strong>
+              <strong>{summary.uniqueTestCases ?? summary.uniqueTestCaseCount ?? 0}</strong>
               <small>Candidate tests selected by matching</small>
             </div>
             <div className="kpi-card kpi-green">
@@ -2215,22 +2575,22 @@ function Dashboard({ summary }) {
             </div>
             <div className="kpi-card kpi-red">
               <div className="kpi-label-row"><span>Mapping Review Queue</span></div>
-              <strong>{summary.reviewNeededRequirements}</strong>
-              <small>Low-confidence mappings</small>
+              <strong>{summary.reviewNeededRequirements ?? summary.reviewNeeded ?? 0}</strong>
+              <small>Unresolved, external, or low-confidence mappings</small>
             </div>
             <div className="kpi-card kpi-teal">
               <div className="kpi-label-row"><span>Estimated Test Time</span></div>
-              <strong>{formatHours(summary.totalTestTimeMinutes)}</strong>
+              <strong>{formatHours(summary.totalTestTimeMinutes ?? summary.estimatedTestTimeMinutes)}</strong>
               <small>Total unique execution duration</small>
             </div>
             <div className="kpi-card kpi-slate">
               <div className="kpi-label-row"><span>High-Risk Requirements</span></div>
-              <strong>{summary.highRiskRequirementCount}</strong>
+              <strong>{summary.highRiskRequirementCount ?? summary.highRiskRequirements ?? 0}</strong>
               <small>ASIL C and ASIL D requirements</small>
             </div>
             <div className="kpi-card kpi-indigo">
               <div className="kpi-label-row"><span>Test Reuse Ratio</span></div>
-              <strong>{summary.testReuseRatio}</strong>
+              <strong>{summary.testReuseRatio ?? 0}</strong>
               <small>Mappings per unique test case</small>
             </div>
           </div>
@@ -2238,7 +2598,7 @@ function Dashboard({ summary }) {
           <div className="executive-summary-card">
             <h3>Executive Summary</h3>
             <p>
-              {summary.executiveSummary ||
+              {summary.executiveSummary ??
                 'Upload analysis completed. Review the coverage, confidence, and test planning indicators below.'}
             </p>
           </div>

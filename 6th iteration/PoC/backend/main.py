@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import difflib
 import io
+import json
+import math
 import re
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -10,16 +13,18 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from ai_services.matching_ai import run_c1_matching_ai
+from ai_services.anomaly_ai import run_c3_anomaly_ai
+from ai_services.prioritizer_ai import run_c2_prioritizer_ai
+from ai_services.report_ai import run_c3_report_drafter_ai
+
 
 app = FastAPI(title="AI Assisted Software Verification Tool API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -29,6 +34,21 @@ MIN_MAPPING_SELECTION_SCORE = 0.55
 MAPPING_REVIEW_THRESHOLD = 0.65
 READY_APPROVAL_THRESHOLD = 0.70
 MAX_PENDING_ANOMALY_REVIEWS = 4
+REFERENCE_MAPPINGS_PATH = Path(__file__).resolve().parent / "data" / "reference_mappings.json"
+EXTERNAL_HMI_VALIDATION_TERMS = {
+    "warning lamp",
+    "dashboard",
+    "instrument cluster",
+    "cluster display",
+    "hud",
+    "display message",
+    "visual alert",
+    "buzzer",
+    "chime",
+    "speaker",
+    "audible alert",
+    "warning sound",
+}
 
 
 TEST_CASE_TOPICS: dict[str, dict[str, Any]] = {
@@ -894,6 +914,97 @@ def build_regression_ranking_reason(asil_level: str, match_score: float, duratio
     return "Prioritized because of " + ", ".join(reasons) + "."
 
 
+def build_deterministic_priority_factor_scores(
+    asil_level: str,
+    match_score: float,
+    duration_minutes: int,
+    requirement_text: str = "",
+) -> dict[str, float]:
+    return {
+        "asil": float({"QM": 5, "A": 15, "B": 25, "C": 35, "D": 45}.get(str(asil_level).upper(), 10)),
+        "safety_behavior": float(min(20, len(detect_safety_priority_groups(requirement_text)) * 4)),
+        "mapping_uncertainty": float(15 if match_score < MAPPING_REVIEW_THRESHOLD else 8 if match_score < READY_APPROVAL_THRESHOLD else 3 if match_score < 0.85 else 0),
+        "duration": float(min(10, max(0, int(duration_minutes) // 360))),
+        "review_dependency": float(10 if infer_review_status(asil_level, match_score) == "MANUAL_REVIEW_REQUIRED" else 0),
+    }
+
+
+def infer_mapping_uncertainty(match_score: float) -> str:
+    if match_score < MAPPING_REVIEW_THRESHOLD:
+        return "high"
+    if match_score < 0.85:
+        return "medium"
+    return "low"
+
+
+def apply_c2_prioritization(match: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(match)
+    asil_level = str(enriched.get("asil_level", "QM"))
+    match_score = float(enriched.get("final_match_score", enriched.get("match_score", 0)))
+    duration_minutes = int(enriched.get("test_duration_minutes", 0))
+    requirement_text = str(enriched.get("requirement_description", ""))
+    deterministic_score = calculate_regression_risk_score(
+        asil_level,
+        match_score,
+        duration_minutes,
+        requirement_text,
+    )
+    deterministic_rationale = build_regression_ranking_reason(
+        asil_level,
+        match_score,
+        duration_minutes,
+        requirement_text,
+    )
+    deterministic_factor_scores = build_deterministic_priority_factor_scores(
+        asil_level,
+        match_score,
+        duration_minutes,
+        requirement_text,
+    )
+    review_status = str(enriched.get("review_status", "review_required"))
+    priority_payload = {
+        "test_case_id": enriched.get("matched_test_case_id"),
+        "test_case_name": enriched.get("matched_test_case_name"),
+        "test_type": enriched.get("test_type"),
+        "linked_requirement": {
+            "requirement_id": enriched.get("requirement_id"),
+            "description": requirement_text,
+            "asil_level": asil_level,
+        },
+        "match_score": match_score,
+        "mapping_uncertainty": infer_mapping_uncertainty(match_score),
+        "estimated_duration_minutes": duration_minutes,
+        "safety_behavior_indicators": sorted(detect_safety_priority_groups(requirement_text)),
+        "review_gate_dependency": review_status,
+        "deterministic_risk_score": deterministic_score,
+        "deterministic_factor_scores": deterministic_factor_scores,
+    }
+    c2_response = run_c2_prioritizer_ai(priority_payload)
+    c2_metadata = c2_response.metadata.model_dump()
+    ai_succeeded = bool(c2_metadata.get("ai_used")) and not bool(c2_metadata.get("fallback_used"))
+    ai_priority_score = float(c2_response.ai_priority_score) if ai_succeeded else float(deterministic_score)
+    final_priority_score = (
+        round(0.65 * ai_priority_score + 0.35 * deterministic_score, 2)
+        if ai_succeeded
+        else float(deterministic_score)
+    )
+    priority_rationale = str(c2_response.rationale).strip() if ai_succeeded else deterministic_rationale
+
+    enriched.update(
+        {
+            "deterministic_regression_risk_score": deterministic_score,
+            "ai_priority_score": round(ai_priority_score, 3),
+            "final_priority_score": final_priority_score,
+            "priority_factor_scores": dict(c2_response.factor_scores) if ai_succeeded else deterministic_factor_scores,
+            "priority_rationale": priority_rationale,
+            "c2_ai_metadata": dict(c2_metadata),
+            "regression_risk_score": final_priority_score,
+            "regression_ranking_reason": priority_rationale,
+        }
+    )
+    return enriched
+
+
 def detect_boundary_clues(requirement_text: str) -> list[str]:
     text = requirement_text.lower()
     clues: list[str] = []
@@ -1115,11 +1226,7 @@ def build_traceability_matrix(matches: list[dict[str, Any]]) -> list[dict[str, A
         asil_level = str(match.get("asil_level", "QM")).upper()
         requirement_text = str(match.get("requirement_description", ""))
         decomposed_clauses = decompose_requirement_clauses(str(match.get("requirement_id", "REQ")), requirement_text)
-        mapping_review = infer_mapping_review_status(
-            match_score,
-            requirement_text,
-            str(match.get("ai_rationale", "")),
-        )
+        mapping_review = mapping_review_fields_from_match(match)
         rows.append(
             {
                 "requirementId": match.get("requirement_id"),
@@ -1130,7 +1237,7 @@ def build_traceability_matrix(matches: list[dict[str, Any]]) -> list[dict[str, A
                 "testCaseId": match.get("matched_test_case_id"),
                 "testCaseName": match.get("matched_test_case_name"),
                 "testType": match.get("test_type"),
-                "coverageType": infer_coverage_type(match_score),
+                "coverageType": match.get("coverageType", match.get("coverage_type", infer_coverage_type(match_score))),
                 "confidence": match_score,
                 "aiRationale": match.get("ai_rationale"),
                 "mappingReviewStatus": mapping_review["mappingReviewStatus"],
@@ -1170,6 +1277,8 @@ def build_candidate1_review_workspace(requirements: pd.DataFrame, matches: list[
                 "testType": str(row["test_type"]),
                 "confidence": float(row["match_score"]),
                 "rationale": str(row.get("ai_rationale", "")),
+                "reasonCodes": list(row.get("reason_codes", [])),
+                "aiMetadata": dict(row.get("ai_metadata", {})),
             }
             for _, row in primary_matches.iterrows()
         ]
@@ -1208,7 +1317,11 @@ def build_candidate1_review_workspace(requirements: pd.DataFrame, matches: list[
         manual_test_design_candidate = build_manual_test_design_candidate(requirement_id, requirement_text, asil_level)
         best_match_score = float(primary_matches.iloc[0]["match_score"]) if not primary_matches.empty else 0.0
         best_match_rationale = str(primary_matches.iloc[0].get("ai_rationale", "")) if not primary_matches.empty else ""
-        mapping_review = infer_mapping_review_status(best_match_score, requirement_text, best_match_rationale)
+        mapping_review = (
+            mapping_review_fields_from_match(primary_matches.iloc[0].to_dict())
+            if not primary_matches.empty
+            else infer_mapping_review_status(best_match_score, requirement_text, best_match_rationale)
+        )
 
         review_items.append(
             {
@@ -1230,6 +1343,7 @@ def build_candidate1_review_workspace(requirements: pd.DataFrame, matches: list[
                 "reviewStatus": mapping_review["reviewStatus"],
                 "engineerDecision": mapping_review["reviewStatus"],
                 "engineerReviewNote": "",
+                "aiMetadata": dict(primary_matches.iloc[0].get("ai_metadata", {})) if not primary_matches.empty else {},
             }
         )
 
@@ -1468,25 +1582,120 @@ def build_anomaly_review_rows(test_rows: list[dict[str, Any]]) -> list[dict[str,
         observed_value = str(row.get("measured_value", ""))
         test_case_name = str(row.get("test_case_name", ""))
         test_type = str(row.get("test_type", ""))
-        anomaly_type = infer_anomaly_type(test_type, test_case_name, observed_value, verdict)
-        confidence = 0.0 if verdict == "PASS" else 0.78 + (len(test_case_name) % 12) / 100
+        anomaly_type = str(row.get("anomaly_type") or infer_anomaly_type(test_type, test_case_name, observed_value, verdict))
+        confidence = float(row.get("anomaly_confidence", 0.0 if verdict == "PASS" else 0.78))
 
         anomaly_rows.append(
             {
                 "testCaseId": row.get("test_case_id"),
                 "testCaseName": test_case_name,
                 "testType": test_type,
-                "expectedBehavior": "Observed ECU response should remain within expected timing, diagnostic, and functional safety limits.",
-                "observedBehavior": observed_value,
+                "expectedBehavior": row.get("expected_behavior", "Observed ECU response should remain within expected timing, diagnostic, and functional safety limits."),
+                "observedBehavior": row.get("observed_behavior", observed_value),
                 "anomalyType": anomaly_type,
                 "confidence": round(confidence, 2),
-                "aiExplanation": build_anomaly_explanation(test_case_name, anomaly_type, observed_value, verdict),
-                "engineerDecision": "No Review Required" if verdict == "PASS" else "Pending Engineer Review",
+                "aiExplanation": row.get("anomaly_explanation") or build_anomaly_explanation(test_case_name, anomaly_type, observed_value, verdict),
+                "engineerDecision": row.get("engineer_action", "Accept" if verdict == "PASS" else "Escalate"),
                 "reviewRequired": verdict != "PASS",
+                "metadata": dict(row.get("anomaly_metadata", {})),
             }
         )
 
     return anomaly_rows
+
+
+def build_simulated_observation(test_row: pd.Series, linked_matches: list[dict[str, Any]]) -> dict[str, Any]:
+    test_case_id = str(test_row.get("matched_test_case_id", "TC-N/A"))
+    test_case_name = str(test_row.get("matched_test_case_name", "Verification Test"))
+    test_type = str(test_row.get("test_type", "Verification"))
+    requirement_text = " ".join(str(match.get("requirement_description", "")) for match in linked_matches)
+    searchable = f"{test_case_name} {test_type} {requirement_text}".lower()
+    risk_score = max((float(match.get("regression_risk_score", 0)) for match in linked_matches), default=0.0)
+    match_score = min((float(match.get("match_score", 1)) for match in linked_matches), default=1.0)
+    review_statuses = {str(match.get("review_status", "")).lower() for match in linked_matches}
+
+    signal_rules = [
+        (("thermal", "temperature", "derating"), "temperature_c", [20.0, 95.0]),
+        (("voltage", "electrical", "battery"), "supply_voltage_v", [9.0, 16.0]),
+        (("timing", "latency", "timeout", "within", " ms"), "response_time_ms", [0.0, 100.0]),
+        (("sensor", "plausibility", "redundant"), "sensor_plausibility_pct", [95.0, 100.0]),
+        (("communication", "can", "message"), "message_health_pct", [98.0, 100.0]),
+        (("warning", "display", "cluster", "hmi", "audible"), "hmi_response_score", [90.0, 100.0]),
+        (("torque", "brake", "actuator"), "command_tracking_pct", [90.0, 110.0]),
+    ]
+    signal_name, expected_range = next(
+        ((name, bounds) for terms, name, bounds in signal_rules if any(term in searchable for term in terms)),
+        ("verification_response_pct", [90.0, 110.0]),
+    )
+    minimum, maximum = expected_range
+    center = (minimum + maximum) / 2
+    width = maximum - minimum
+    seed = sum(ord(character) for character in test_case_id)
+    observed_series = [
+        round(center + math.sin((seed + index) * 0.47) * width * 0.08, 3)
+        for index in range(24)
+    ]
+    anomaly_candidate = (
+        risk_score >= 80
+        or match_score < MAPPING_REVIEW_THRESHOLD
+        or bool(review_statuses & {"review_required", "weak_fallback", "external_validation_required"})
+    )
+    protocol_logs = [
+        f"SIM signal={signal_name} test_case={test_case_id}",
+        f"SIM risk_score={risk_score:g} match_score={match_score:.3f}",
+        "SIM protocol response remained valid",
+    ]
+    if anomaly_candidate:
+        excursion = maximum + max(width * 0.18, 1.0)
+        observed_series[-3:] = [round(excursion + index * width * 0.03, 3) for index in range(3)]
+        protocol_logs[-1] = "SIM anomaly indicator: response outside configured expected range; engineer review required"
+
+    return {
+        "test_case_id": test_case_id,
+        "test_case_name": test_case_name,
+        "signal_name": signal_name,
+        "expected_range": expected_range,
+        "observed_series": observed_series,
+        "expected_behavior": f"{signal_name} should remain within [{minimum:g}, {maximum:g}] during the simulated verification observation.",
+        "protocol_logs": protocol_logs,
+        "linked_requirements": [
+            {
+                "requirement_id": match.get("requirement_id"),
+                "description": match.get("requirement_description"),
+                "asil_level": match.get("asil_level"),
+                "match_score": match.get("match_score"),
+                "regression_risk_score": match.get("regression_risk_score"),
+            }
+            for match in linked_matches
+        ],
+    }
+
+
+def build_c3_audit_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for index, row in enumerate(rows, start=1):
+        metadata = dict(row.get("anomaly_metadata", {}))
+        events.append(
+            {
+                "eventId": f"AUD-C3-{index:03d}",
+                "eventType": "AI_ANOMALY_DETECTION",
+                "actor": "C3 Chronos Anomaly Detector",
+                "relatedItem": row.get("test_case_id"),
+                "details": (
+                    f"Verdict {row.get('result')} for {row.get('test_case_id')}; "
+                    f"anomaly type: {row.get('anomaly_type')}; confidence: {row.get('anomaly_confidence')}."
+                ),
+                "test_case_id": row.get("test_case_id"),
+                "model_name": metadata.get("model_name"),
+                "ai_used": bool(metadata.get("ai_used", False)),
+                "fallback_used": bool(metadata.get("fallback_used", False)),
+                "fallback_reason": metadata.get("fallback_reason"),
+                "verdict": row.get("result"),
+                "anomaly_type": row.get("anomaly_type"),
+                "confidence": row.get("anomaly_confidence"),
+            }
+        )
+    return events
 
 
 def build_audit_log(
@@ -1500,10 +1709,10 @@ def build_audit_log(
     review_required_count = sum(
         1
         for match in matches
-        if infer_review_status(str(match.get("asil_level", "QM")), float(match.get("match_score", 0))) == "MANUAL_REVIEW_REQUIRED"
+        if mapping_review_fields_from_match(match)["mappingReviewStatus"] == "MAPPING_REVIEW_REQUIRED"
     )
 
-    return [
+    audit_events = [
         {
             "eventId": "AUD-001",
             "eventType": "File Upload",
@@ -1544,6 +1753,77 @@ def build_audit_log(
             "details": f"Flagged {review_required_count} candidate mapping(s) for manual or safety engineer review.",
         },
     ]
+    matches_by_requirement: dict[str, list[dict[str, Any]]] = {}
+    for match in matches:
+        matches_by_requirement.setdefault(str(match.get("requirement_id", "REQ-N/A")), []).append(match)
+
+    for index, (requirement_id, requirement_matches) in enumerate(matches_by_requirement.items(), start=1):
+        first_match = requirement_matches[0]
+        metadata = dict(first_match.get("ai_metadata", {}))
+        reason_codes = sorted(
+            {
+                str(code)
+                for match in requirement_matches
+                for code in match.get("reason_codes", [])
+            }
+        )
+        selected_test_case_ids = [str(match.get("matched_test_case_id", "")) for match in requirement_matches]
+        review_status = str(first_match.get("review_status", "review_required"))
+        audit_events.append(
+            {
+                "eventId": f"AUD-AI-{index:03d}",
+                "eventType": "AI_MATCHING",
+                "actor": "C1 AI Matching Engine",
+                "relatedItem": requirement_id,
+                "details": (
+                    f"Selected test case(s): {', '.join(selected_test_case_ids)}; "
+                    f"AI used: {metadata.get('ai_used', False)}; "
+                    f"fallback used: {metadata.get('fallback_used', False)}; "
+                    f"review status: {review_status}."
+                ),
+                "requirement_id": requirement_id,
+                "selected_test_case_ids": selected_test_case_ids,
+                "ai_used": bool(metadata.get("ai_used", False)),
+                "model_name": metadata.get("model_name"),
+                "fallback_used": bool(metadata.get("fallback_used", False)),
+                "fallback_reason": metadata.get("fallback_reason"),
+                "review_status": review_status,
+                "reason_codes": reason_codes,
+            }
+        )
+
+    for index, match in enumerate(matches, start=1):
+        metadata = dict(match.get("c2_ai_metadata", {}))
+        test_case_id = str(match.get("matched_test_case_id", "TC-N/A"))
+        requirement_id = str(match.get("requirement_id", "REQ-N/A"))
+        deterministic_score = float(match.get("deterministic_regression_risk_score", match.get("regression_risk_score", 0)))
+        ai_priority_score = float(match.get("ai_priority_score", deterministic_score))
+        final_priority_score = float(match.get("final_priority_score", match.get("regression_risk_score", deterministic_score)))
+        rationale = str(match.get("priority_rationale", match.get("regression_ranking_reason", "")))
+        audit_events.append(
+            {
+                "eventId": f"AUD-C2-{index:03d}",
+                "eventType": "AI_REGRESSION_PRIORITIZATION",
+                "actor": "C2 AI Regression Prioritizer",
+                "relatedItem": test_case_id,
+                "details": (
+                    f"Prioritized {test_case_id} for {requirement_id}; deterministic score: {deterministic_score}; "
+                    f"AI priority score: {ai_priority_score}; final priority score: {final_priority_score}."
+                ),
+                "test_case_id": test_case_id,
+                "requirement_id": requirement_id,
+                "model_name": metadata.get("model_name"),
+                "ai_used": bool(metadata.get("ai_used", False)),
+                "fallback_used": bool(metadata.get("fallback_used", False)),
+                "fallback_reason": metadata.get("fallback_reason"),
+                "deterministic_risk_score": deterministic_score,
+                "ai_priority_score": ai_priority_score,
+                "final_priority_score": final_priority_score,
+                "rationale": rationale,
+            }
+        )
+
+    return audit_events
 
 def tokenize_for_matching(text: str) -> set[str]:
     normalized = re.sub(r"[^a-z0-9]+", " ", str(text).lower())
@@ -1614,50 +1894,266 @@ def detect_safety_priority_groups(requirement_text: str) -> set[str]:
     return requirement_groups & {"fault", "fallback", "threshold", "sensor", "communication", "thermal", "electrical", "memory", "actuator"}
 
 
+def load_reference_mappings() -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(REFERENCE_MAPPINGS_PATH.read_text(encoding="utf-8"))
+        reference_mappings = payload.get("reference_mappings", [])
+        return reference_mappings if isinstance(reference_mappings, list) else []
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+
+
+def requires_external_hmi_validation(requirement_text: str) -> bool:
+    normalized = str(requirement_text).lower()
+    return any(term in normalized for term in EXTERNAL_HMI_VALIDATION_TERMS)
+
+
+def normalize_c1_review_status(review_status: str, match_score: float) -> str:
+    normalized = str(review_status or "").strip().lower()
+    if normalized == "external_validation_required":
+        return normalized
+    if match_score < MIN_MAPPING_SELECTION_SCORE:
+        return "weak_fallback"
+    if match_score < MAPPING_REVIEW_THRESHOLD:
+        return "review_required"
+    if match_score < READY_APPROVAL_THRESHOLD and normalized == "ready":
+        return "review_recommended"
+    if normalized in {
+        "ready",
+        "review_recommended",
+        "review_required",
+        "weak_fallback",
+        "external_validation_required",
+    }:
+        return normalized
+    if match_score < READY_APPROVAL_THRESHOLD:
+        return "review_recommended"
+    return "ready"
+
+
+def normalize_c1_coverage_type(coverage_type: str, match_score: float) -> str:
+    normalized = str(coverage_type or "").strip().lower()
+    if normalized in {"direct", "partial", "weak", "external_validation_required"}:
+        return normalized
+    if match_score >= 0.85:
+        return "direct"
+    if match_score >= MAPPING_REVIEW_THRESHOLD:
+        return "partial"
+    return "weak"
+
+
+def mapping_review_fields_from_match(match: dict[str, Any]) -> dict[str, Any]:
+    review_status = str(match.get("review_status", "")).strip().lower()
+    reason_codes = [str(code) for code in match.get("reason_codes", [])]
+    if review_status in {"review_required", "weak_fallback", "external_validation_required"}:
+        mapping_status = "MAPPING_REVIEW_REQUIRED"
+    elif review_status == "review_recommended":
+        mapping_status = "REVIEW_RECOMMENDED"
+    else:
+        mapping_status = "READY_FOR_APPROVAL"
+
+    if reason_codes:
+        reason = "Mapping review context: " + ", ".join(code.lower().replace("_", " ") for code in reason_codes) + "."
+    elif mapping_status == "READY_FOR_APPROVAL":
+        reason = "Requirement-to-test mapping score is sufficient for engineer approval."
+    else:
+        reason = "Engineer review is required before this mapping is used as verification evidence."
+
+    return {
+        "mappingReviewStatus": mapping_status,
+        "mappingReviewReason": reason,
+        "mappingReviewReasonCodes": reason_codes,
+        "reviewStatus": review_status or "review_required",
+    }
+
+
 def match_requirements(requirements: pd.DataFrame) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    reference_mappings = load_reference_mappings()
 
-    for idx, row in requirements.reset_index(drop=True).iterrows():
+    for _, row in requirements.reset_index(drop=True).iterrows():
         requirement_description = str(row["description"]).strip()
+        requirement_id = str(row["requirement_id"])
+        asil_level = str(row["asil_level"])
         scored_matches: list[dict[str, Any]] = []
 
         for _, test_case in TEST_CASES.iterrows():
-            rounded_score = calculate_hybrid_match_score(requirement_description, str(row["asil_level"]), test_case)
+            rounded_score = calculate_hybrid_match_score(requirement_description, asil_level, test_case)
             rounded_score = round(float(rounded_score), 2)
             duration_minutes = int(test_case["duration_minutes"])
-            asil_level = str(row["asil_level"])
             scored_matches.append(
                 {
-                    "requirement_id": row["requirement_id"],
+                    "requirement_id": requirement_id,
                     "requirement_description": requirement_description,
                     "asil_level": asil_level,
-                    "matched_test_case_id": test_case["test_case_id"],
-                    "matched_test_case_name": test_case["test_case_name"],
-                    "test_type": test_case["test_type"],
+                    "matched_test_case_id": str(test_case["test_case_id"]),
+                    "matched_test_case_name": str(test_case["test_case_name"]),
+                    "test_type": str(test_case["test_type"]),
                     "test_duration_minutes": duration_minutes,
-                    "match_score": rounded_score,
-                    "regression_risk_score": calculate_regression_risk_score(asil_level, rounded_score, duration_minutes, requirement_description),
-                    "regression_ranking_reason": build_regression_ranking_reason(asil_level, rounded_score, duration_minutes, requirement_description),
-                    "ai_rationale": build_ai_rationale(
-                        requirement_description,
-                        str(test_case["test_case_name"]),
-                        str(test_case["description"]),
-                        rounded_score,
-                    ),
+                    "test_description": str(test_case["description"]),
+                    "legacy_rule_score": rounded_score,
                 }
             )
 
-        scored_matches.sort(key=lambda item: item["match_score"], reverse=True)
+        scored_matches.sort(key=lambda item: item["legacy_rule_score"], reverse=True)
+        candidate_pool = scored_matches[:20]
+        candidate_tests = [
+            {
+                "test_case_id": item["matched_test_case_id"],
+                "test_case_name": item["matched_test_case_name"],
+                "test_type": item["test_type"],
+                "description": item["test_description"],
+                "duration_minutes": item["test_duration_minutes"],
+                "semantic_or_candidate_score": item["legacy_rule_score"],
+                "legacy_rule_score": item["legacy_rule_score"],
+            }
+            for item in candidate_pool
+        ]
+        legacy_rule_scores = [
+            {
+                "test_case_id": item["matched_test_case_id"],
+                "legacy_rule_score": item["legacy_rule_score"],
+                "semantic_or_candidate_score": item["legacy_rule_score"],
+            }
+            for item in candidate_pool
+        ]
+        c1_response = run_c1_matching_ai(
+            requirement={
+                "requirement_id": requirement_id,
+                "description": requirement_description,
+                "asil_level": asil_level,
+            },
+            candidate_tests=candidate_tests,
+            reference_mappings=reference_mappings,
+            legacy_rule_scores=legacy_rule_scores,
+        )
+        c1_metadata = c1_response.metadata.model_dump()
+        ai_succeeded = bool(c1_metadata.get("ai_used")) and not bool(c1_metadata.get("fallback_used"))
+        candidate_lookup = {item["matched_test_case_id"]: item for item in scored_matches}
+        finalized_matches: list[dict[str, Any]] = []
+
+        for selected in c1_response.selected_mappings:
+            test_case_id = str(selected.get("test_case_id", ""))
+            candidate = candidate_lookup.get(test_case_id)
+            if candidate is None:
+                continue
+
+            legacy_rule_score = float(candidate["legacy_rule_score"])
+            ai_match_score = float(selected.get("ai_match_score", legacy_rule_score)) if ai_succeeded else legacy_rule_score
+            final_match_score = (
+                round(0.70 * ai_match_score + 0.15 * legacy_rule_score + 0.15 * legacy_rule_score, 3)
+                if ai_succeeded
+                else legacy_rule_score
+            )
+            reason_codes = [str(code) for code in selected.get("reason_codes", [])]
+            if c1_metadata.get("fallback_used") and "AI_FALLBACK_USED" not in reason_codes:
+                reason_codes.append("AI_FALLBACK_USED")
+            if final_match_score < MAPPING_REVIEW_THRESHOLD and "LOW_MATCH_SCORE" not in reason_codes:
+                reason_codes.append("LOW_MATCH_SCORE")
+            coverage_type = normalize_c1_coverage_type(str(selected.get("coverage_type", "")), final_match_score)
+            review_status = normalize_c1_review_status(c1_response.review_status, final_match_score)
+            ai_rationale = str(selected.get("rationale", "")).strip() if ai_succeeded else ""
+            if not ai_rationale:
+                ai_rationale = build_ai_rationale(
+                    requirement_description,
+                    candidate["matched_test_case_name"],
+                    candidate["test_description"],
+                    final_match_score,
+                )
+
+            if requires_external_hmi_validation(requirement_description):
+                coverage_type = "external_validation_required"
+                review_status = "external_validation_required"
+                if "EXTERNAL_HMI_VALIDATION_REQUIRED" not in reason_codes:
+                    reason_codes.append("EXTERNAL_HMI_VALIDATION_REQUIRED")
+                ai_rationale += " Physical HMI, visual, or audio behavior requires external validation before evidence approval."
+
+            finalized_matches.append(
+                {
+                    "requirement_id": requirement_id,
+                    "requirement_description": requirement_description,
+                    "asil_level": asil_level,
+                    "matched_test_case_id": test_case_id,
+                    "matched_test_case_name": candidate["matched_test_case_name"],
+                    "test_type": candidate["test_type"],
+                    "test_duration_minutes": candidate["test_duration_minutes"],
+                    "match_score": final_match_score,
+                    "ai_match_score": round(ai_match_score, 3),
+                    "legacy_rule_score": legacy_rule_score,
+                    "final_match_score": final_match_score,
+                    "coverage_type": coverage_type,
+                    "coverageType": coverage_type,
+                    "review_status": review_status,
+                    "reviewStatus": review_status,
+                    "reason_codes": reason_codes,
+                    "reasonCodes": reason_codes,
+                    "ai_metadata": dict(c1_metadata),
+                    "regression_risk_score": calculate_regression_risk_score(
+                        asil_level, final_match_score, candidate["test_duration_minutes"], requirement_description
+                    ),
+                    "regression_ranking_reason": build_regression_ranking_reason(
+                        asil_level, final_match_score, candidate["test_duration_minutes"], requirement_description
+                    ),
+                    "ai_rationale": ai_rationale,
+                }
+            )
 
         selected_matches = [
-            match for match in scored_matches
+            match for match in finalized_matches
             if float(match.get("match_score", 0)) >= MIN_MAPPING_SELECTION_SCORE
         ]
-
         if not selected_matches and scored_matches:
-            selected_matches = scored_matches[:1]
+            best = scored_matches[0]
+            legacy_score = float(best["legacy_rule_score"])
+            fallback_reason = "No C1-selected mapping met the minimum mapping threshold; best legacy candidate used."
+            reason_codes = ["WEAK_FALLBACK"]
+            coverage_type = "weak"
+            review_status = "weak_fallback"
+            if requires_external_hmi_validation(requirement_description):
+                coverage_type = "external_validation_required"
+                review_status = "external_validation_required"
+                reason_codes.append("EXTERNAL_HMI_VALIDATION_REQUIRED")
+            selected_matches = [
+                {
+                    "requirement_id": requirement_id,
+                    "requirement_description": requirement_description,
+                    "asil_level": asil_level,
+                    "matched_test_case_id": best["matched_test_case_id"],
+                    "matched_test_case_name": best["matched_test_case_name"],
+                    "test_type": best["test_type"],
+                    "test_duration_minutes": best["test_duration_minutes"],
+                    "match_score": legacy_score,
+                    "ai_match_score": legacy_score,
+                    "legacy_rule_score": legacy_score,
+                    "final_match_score": legacy_score,
+                    "coverage_type": coverage_type,
+                    "coverageType": coverage_type,
+                    "review_status": review_status,
+                    "reviewStatus": review_status,
+                    "reason_codes": reason_codes,
+                    "reasonCodes": reason_codes,
+                    "ai_metadata": {
+                        "ai_used": False,
+                        "model_name": c1_metadata.get("model_name"),
+                        "fallback_used": True,
+                        "fallback_reason": fallback_reason,
+                    },
+                    "regression_risk_score": calculate_regression_risk_score(
+                        asil_level, legacy_score, best["test_duration_minutes"], requirement_description
+                    ),
+                    "regression_ranking_reason": build_regression_ranking_reason(
+                        asil_level, legacy_score, best["test_duration_minutes"], requirement_description
+                    ),
+                    "ai_rationale": build_ai_rationale(
+                        requirement_description,
+                        best["matched_test_case_name"],
+                        best["test_description"],
+                        legacy_score,
+                    ),
+                }
+            ]
 
-        results.extend(selected_matches[:3])
+        results.extend(apply_c2_prioritization(match) for match in selected_matches[:3])
 
     return results
 
@@ -1900,6 +2396,8 @@ class ReportRequest(BaseModel):
     candidate1Decisions: dict[str, str] = {}
     candidate1ReviewNotes: dict[str, str] = {}
     candidate1RecoveryRecords: dict[str, dict[str, Any]] = {}
+    traceabilityMatrix: list[dict[str, Any]] = []
+    simulationResults: list[dict[str, Any]] = []
 
 
 @app.get("/health")
@@ -1950,33 +2448,44 @@ def simulate_tests(payload: dict[str, Any]) -> dict[str, Any]:
     unique_tests = match_df.drop_duplicates(subset=["matched_test_case_id"]).copy()
 
     rows: list[dict[str, Any]] = []
-    review_counter = 0
-    for idx, row in unique_tests.reset_index(drop=True).iterrows():
-        should_review = idx % 5 == 4 and review_counter < MAX_PENDING_ANOMALY_REVIEWS
-        verdict = "REVIEW" if should_review else "PASS"
-        anomaly_scenario = ANOMALY_SCENARIOS[review_counter % len(ANOMALY_SCENARIOS)] if verdict == "REVIEW" else None
-        if verdict == "REVIEW":
-            review_counter += 1
-
+    for _, row in unique_tests.reset_index(drop=True).iterrows():
+        test_case_id = str(row["matched_test_case_id"])
+        linked_matches = match_df[match_df["matched_test_case_id"].astype(str) == test_case_id].to_dict(orient="records")
+        observation = build_simulated_observation(row, linked_matches)
+        anomaly_result = run_c3_anomaly_ai(observation)
+        anomaly_metadata = anomaly_result.metadata.model_dump()
         rows.append(
             {
-                "test_case_id": row["matched_test_case_id"],
+                "test_case_id": test_case_id,
                 "test_case_name": row["matched_test_case_name"],
                 "test_type": row["test_type"],
                 "duration_minutes": int(row["test_duration_minutes"]),
-                "result": verdict,
-                "measured_value": "Within expected range" if verdict == "PASS" else anomaly_scenario["observed_value"],
-                "engineer_action": "Accept result" if verdict == "PASS" else anomaly_scenario["engineer_action"],
+                "result": anomaly_result.verdict,
+                "measured_value": anomaly_result.observed_behavior,
+                "engineer_action": anomaly_result.recommended_engineer_action,
+                "expected_behavior": observation["expected_behavior"],
+                "signal_name": observation["signal_name"],
+                "expected_range": observation["expected_range"],
+                "observed_series": observation["observed_series"],
+                "protocol_logs": observation["protocol_logs"],
+                "anomaly_metadata": anomaly_metadata,
+                "anomaly_type": anomaly_result.anomaly_type,
+                "anomaly_confidence": anomaly_result.confidence,
+                "observed_behavior": anomaly_result.observed_behavior,
+                "anomaly_explanation": anomaly_result.explanation,
             }
         )
 
     anomaly_review = build_anomaly_review_rows(rows)
     protocol_logs = build_protocol_execution_logs(unique_tests, mapping_count=len(matches))
+    anomaly_audit_log = build_c3_audit_events(rows)
 
     return {
         "results": rows,
         "anomalyReview": anomaly_review,
         "protocolLogs": protocol_logs,
+        "auditLog": anomaly_audit_log,
+        "anomalyAuditLog": anomaly_audit_log,
         "summary": {
             "executedTestCases": len(rows),
             "passCount": sum(1 for row in rows if row["result"] == "PASS"),
@@ -1992,8 +2501,6 @@ def draft_report(payload: ReportRequest) -> dict[str, Any]:
     matches = payload.matches
     decisions = payload.decisions
     candidate1_decisions = payload.candidate1Decisions or {}
-    candidate1_review_notes = payload.candidate1ReviewNotes or {}
-    candidate1_recovery_records = payload.candidate1RecoveryRecords or {}
 
     if not matches:
         raise HTTPException(status_code=400, detail="No matches were provided.")
@@ -2007,111 +2514,162 @@ def draft_report(payload: ReportRequest) -> dict[str, Any]:
     average_confidence = round(float(match_df["match_score"].mean()), 3) if "match_score" in match_df.columns and total_mappings else 0
     total_test_time_minutes = int(unique_tests["test_duration_minutes"].sum()) if "test_duration_minutes" in unique_tests.columns else 0
 
-    accepted_decisions = [
+    accepted_decisions = [decision for decision in decisions if any(term in decision.decision.upper() for term in ("ACCEPT", "APPROVE"))]
+    rejected_decisions = [decision for decision in decisions if any(term in decision.decision.upper() for term in ("REJECT", "DENIED", "DENY"))]
+    unresolved_decisions = [
         decision for decision in decisions
-        if "ACCEPT" in decision.decision.upper() or "APPROVE" in decision.decision.upper()
-    ]
-    rejected_decisions = [
-        decision for decision in decisions
-        if "REJECT" in decision.decision.upper() or "DENIED" in decision.decision.upper()
+        if decision not in accepted_decisions and decision not in rejected_decisions
     ]
 
-    candidate1_approved = [
-        requirement_id for requirement_id, decision in candidate1_decisions.items()
-        if str(decision).upper() == "APPROVED_BY_ENGINEER"
+    candidate1_approved = [key for key, value in candidate1_decisions.items() if str(value).upper() == "APPROVED_BY_ENGINEER"]
+    candidate1_alternative_selected = [key for key, value in candidate1_decisions.items() if str(value).upper() == "REJECTED_WITH_ALTERNATIVE"]
+    candidate1_manual_requested = [key for key, value in candidate1_decisions.items() if str(value).upper() == "MANUAL_TEST_REQUESTED"]
+    candidate1_rejected = [key for key, value in candidate1_decisions.items() if str(value).upper() == "REJECTED_BY_ENGINEER"]
+    resolved_mapping_requirements = set(candidate1_approved + candidate1_alternative_selected)
+
+    unresolved_mapping_requirements: set[str] = set()
+    external_validation_requirements: set[str] = set()
+    untestable_requirements: set[str] = set()
+    for match in matches:
+        requirement_id = str(match.get("requirement_id", match.get("requirementId", "UNKNOWN")))
+        review_status = str(match.get("review_status", match.get("reviewStatus", ""))).lower()
+        mapping_review_status = str(match.get("mappingReviewStatus", "")).upper()
+        coverage_type = str(match.get("coverage_type", match.get("coverageType", ""))).lower()
+        if coverage_type == "external_validation_required" or review_status == "external_validation_required":
+            external_validation_requirements.add(requirement_id)
+        if bool(match.get("untestable")) or review_status == "untestable":
+            untestable_requirements.add(requirement_id)
+        if (
+            review_status in {"review_required", "weak_fallback", "external_validation_required", "untestable"}
+            or mapping_review_status == "MAPPING_REVIEW_REQUIRED"
+        ) and requirement_id not in resolved_mapping_requirements:
+            unresolved_mapping_requirements.add(requirement_id)
+
+    review_simulation_ids = {
+        str(item.get("test_case_id", item.get("testCaseId", "")))
+        for item in payload.simulationResults
+        if str(item.get("result", "")).upper() == "REVIEW"
+    }
+    decided_test_ids = {decision.testCaseId for decision in decisions}
+    unresolved_anomaly_ids = sorted(
+        (review_simulation_ids - decided_test_ids)
+        | {decision.testCaseId for decision in unresolved_decisions}
+        | {decision.testCaseId for decision in rejected_decisions}
+    )
+
+    unresolved_issues = [
+        *[f"Mapping requires engineer resolution: {item}" for item in sorted(unresolved_mapping_requirements)],
+        *[f"Anomaly decision remains open or rejected: {item}" for item in unresolved_anomaly_ids],
+        *[f"External physical validation remains required: {item}" for item in sorted(external_validation_requirements)],
+        *[f"Requirement is currently untestable: {item}" for item in sorted(untestable_requirements)],
+        *[f"Manual test design remains required: {item}" for item in sorted(candidate1_manual_requested)],
+        *[f"Candidate mapping remains rejected: {item}" for item in sorted(candidate1_rejected)],
     ]
-    candidate1_rejected = [
-        requirement_id for requirement_id, decision in candidate1_decisions.items()
-        if str(decision).upper() == "REJECTED_BY_ENGINEER"
+    unresolved_issues = list(dict.fromkeys(unresolved_issues))
+    blocking_issues = unresolved_issues[:50]
+    can_approve = not blocking_issues
+    report_status = "READY_FOR_APPROVAL" if can_approve else ("BLOCKED" if untestable_requirements else "REQUIRES_REVIEW")
+    approval_gate = {
+        "status": report_status,
+        "canApprove": can_approve,
+        "blockingIssues": blocking_issues,
+        "requiredApprover": "Functional Safety Engineer",
+        "message": (
+            "Draft evidence is ready for Functional Safety Engineer approval; approval has not been granted."
+            if can_approve
+            else f"Functional Safety Engineer approval is blocked by {len(blocking_issues)} unresolved issue(s)."
+        ),
+        "approvalStatus": "Pending Safety Engineer Review",
+        "reviewerRole": "Functional Safety Engineer",
+        "approvalRequired": True,
+        "controlRationale": "The backend determines readiness from unresolved mappings, anomaly decisions, and external validation obligations. The NLG drafter cannot approve this report.",
+    }
+
+    summary_metrics = {
+        "requirementCount": requirement_count,
+        "uniqueTestCaseCount": unique_test_count,
+        "mappingCount": total_mappings,
+        "averageConfidence": average_confidence,
+        "estimatedTestTimeMinutes": total_test_time_minutes,
+        "acceptedResultCount": len(accepted_decisions),
+        "rejectedResultCount": len(rejected_decisions),
+        "unresolvedAnomalyDecisionCount": len(unresolved_anomaly_ids),
+        "approvedMappingCount": len(candidate1_approved) + len(candidate1_alternative_selected),
+        "rejectedMappingCount": len(candidate1_rejected),
+        "untestableRequirementCount": len(untestable_requirements),
+        "externalValidationRequiredCount": len(external_validation_requirements),
+        "unresolvedIssueCount": len(unresolved_issues),
+        "candidate1ApprovedCount": len(candidate1_approved),
+        "candidate1AlternativeRecoveryCount": len(candidate1_alternative_selected),
+        "candidate1ManualDesignCount": len(candidate1_manual_requested),
+        "candidate1KeptRejectedCount": len(candidate1_rejected),
+    }
+    deterministic_text = {
+        "scope_summary": f"The draft covers {requirement_count} requirements, {total_mappings} mappings, and {unique_test_count} unique candidate test cases.",
+        "safety_context": "This report supports Functional Safety Engineer review and does not establish ISO 26262 certification or final safety approval.",
+        "traceability_evidence": f"Average mapping confidence is {round(average_confidence * 100, 1)}%; {len(unresolved_mapping_requirements)} mapping requirement(s) remain unresolved.",
+        "test_portfolio_summary": f"Estimated unique simulated test effort is {total_test_time_minutes} minutes across {unique_test_count} test cases.",
+        "anomaly_review_summary": f"Engineer decisions include {len(accepted_decisions)} accepted, {len(rejected_decisions)} rejected, and {len(unresolved_anomaly_ids)} unresolved anomaly result(s).",
+        "engineer_decision_summary": f"{len(candidate1_approved)} mappings were approved and {len(candidate1_alternative_selected)} were resolved using alternatives; unresolved items remain subject to engineer action.",
+        "limitations": "Execution evidence is simulated. Real ECU/HIL execution, physical HMI validation, and formal safety confirmation are outside this draft.",
+        "approval_gate_statement": approval_gate["message"],
+    }
+    compact_mappings = [
+        {
+            "requirement_id": item.get("requirement_id"),
+            "test_case_id": item.get("matched_test_case_id"),
+            "asil_level": item.get("asil_level"),
+            "match_score": item.get("match_score"),
+            "coverage_type": item.get("coverage_type", item.get("coverageType")),
+            "review_status": item.get("review_status", item.get("reviewStatus")),
+        }
+        for item in matches[:25]
     ]
-    candidate1_alternative_selected = [
-        requirement_id for requirement_id, decision in candidate1_decisions.items()
-        if str(decision).upper() == "REJECTED_WITH_ALTERNATIVE"
-    ]
-    candidate1_manual_requested = [
-        requirement_id for requirement_id, decision in candidate1_decisions.items()
-        if str(decision).upper() == "MANUAL_TEST_REQUESTED"
-    ]
-
-    recovery_record_rows: list[str] = []
-    for requirement_id, record in candidate1_recovery_records.items():
-        recovery_action = str(record.get("recoveryAction", "UNKNOWN"))
-        review_note = candidate1_review_notes.get(requirement_id, "")
-
-        if recovery_action == "ALTERNATIVE_SELECTED":
-            recovery_record_rows.append(
-                f"{requirement_id}: rejected AI candidate recovered using alternative test case "
-                f"{record.get('selectedAlternativeTestCaseId', 'N/A')} - "
-                f"{record.get('selectedAlternativeTestCaseName', 'Unnamed alternative')}."
-            )
-        elif recovery_action == "MANUAL_TEST_REQUESTED":
-            file_name = record.get("manualTestFileName") or "manual test file not uploaded yet"
-            recovery_record_rows.append(
-                f"{requirement_id}: manual test design requested; uploaded evidence file: {file_name}."
-            )
-        elif recovery_action == "KEEP_REJECTED":
-            recovery_record_rows.append(
-                f"{requirement_id}: AI-generated candidate kept rejected and reported as an unresolved verification evidence gap."
-            )
-        else:
-            recovery_record_rows.append(f"{requirement_id}: recovery action recorded as {recovery_action}.")
-
-        if review_note:
-            recovery_record_rows.append(f"{requirement_id} engineer note: {review_note}")
-
-    if not recovery_record_rows:
-        recovery_record_rows.append("No Candidate 1 rejection recovery records were submitted with this report request.")
-
+    traceability_matrix = payload.traceabilityMatrix or build_traceability_matrix(matches)
+    report_payload = {
+        **deterministic_text,
+        "summary_metrics": summary_metrics,
+        "mappings": compact_mappings,
+        "traceability_matrix": traceability_matrix[:20],
+        "simulation_results": payload.simulationResults[:20],
+        "anomaly_decisions": [decision.model_dump() for decision in decisions[:20]],
+        "candidate1_decisions": list(candidate1_decisions.items())[:25],
+        "candidate1_review_notes": dict(list((payload.candidate1ReviewNotes or {}).items())[:10]),
+        "candidate1_recovery_records": dict(list((payload.candidate1RecoveryRecords or {}).items())[:10]),
+        "unresolved_issues": unresolved_issues[:25],
+        "external_validation_required": sorted(external_validation_requirements)[:25],
+        "report_status": report_status,
+        "approval_gate": approval_gate,
+    }
+    report_draft = run_c3_report_drafter_ai(report_payload)
+    ai_metadata = report_draft.metadata.model_dump()
     sections = [
-        {
-            "title": "Executive Summary",
-            "body": [
-                f"The uploaded requirement set contains {requirement_count} requirement(s) mapped to {unique_test_count} unique candidate test case(s).",
-                f"The generated traceability set contains {total_mappings} requirement-to-test mapping(s) with average AI confidence of {round(average_confidence * 100, 1)}%.",
-                f"Estimated unique test execution effort is {round(total_test_time_minutes / 60, 1)} hour(s).",
-            ],
-        },
-        {
-            "title": "Engineer Approval Gate",
-            "body": [
-                f"Engineer accepted {len(accepted_decisions)} simulated test result(s) and rejected {len(rejected_decisions)} simulated test result(s).",
-                "Accepted results are eligible for draft evidence inclusion. Rejected or denied results remain open engineering actions and should not be used as final evidence.",
-            ],
-        },
-        {
-            "title": "Candidate 1 Rejection Recovery Summary",
-            "body": [
-                f"Approved AI-generated candidate tests: {len(candidate1_approved)}.",
-                f"Rejected candidates recovered with selected alternatives: {len(candidate1_alternative_selected)}.",
-                f"Rejected candidates routed to manual test design: {len(candidate1_manual_requested)}.",
-                f"Rejected candidates kept rejected as unresolved evidence gaps: {len(candidate1_rejected)}.",
-                *recovery_record_rows,
-            ],
-        },
-        {
-            "title": "Functional Safety Review Notes",
-            "body": [
-                "This report is a draft artifact for review support and does not replace engineer judgment, safety assessment, or formal ISO 26262 confirmation measures.",
-                "AI-generated requirements extraction, test case derivation, anomaly explanation, and report text must remain subject to mandatory human approval before final evidence use.",
-                "Any unresolved rejected candidate test or manual test design request should be tracked as an open verification action before final release or assessment submission.",
-            ],
-        },
+        {"title": "Scope Summary", "body": report_draft.scope_summary},
+        {"title": "Safety Context", "body": report_draft.safety_context},
+        {"title": "Traceability Evidence", "body": report_draft.traceability_evidence},
+        {"title": "Test Portfolio Summary", "body": report_draft.test_portfolio_summary},
+        {"title": "Anomaly Review Summary", "body": report_draft.anomaly_review_summary},
+        {"title": "Engineer Decision Summary", "body": report_draft.engineer_decision_summary},
+        {"title": "Limitations", "body": report_draft.limitations},
+        {"title": "Approval Gate", "body": report_draft.approval_gate_statement},
     ]
+    audit_event = {
+        "eventType": "AI_REPORT_DRAFTING",
+        "model_name": ai_metadata.get("model_name"),
+        "ai_used": ai_metadata.get("ai_used", False),
+        "fallback_used": ai_metadata.get("fallback_used", True),
+        "fallback_reason": ai_metadata.get("fallback_reason"),
+        "report_status": report_status,
+        "unresolved_issue_count": len(unresolved_issues),
+    }
 
     return {
-        "title": "Draft ISO 26262 Compliance Report",
-        "summary": {
-            "requirementCount": requirement_count,
-            "uniqueTestCaseCount": unique_test_count,
-            "mappingCount": total_mappings,
-            "averageConfidence": average_confidence,
-            "estimatedTestTimeMinutes": total_test_time_minutes,
-            "acceptedResultCount": len(accepted_decisions),
-            "rejectedResultCount": len(rejected_decisions),
-            "candidate1ApprovedCount": len(candidate1_approved),
-            "candidate1AlternativeRecoveryCount": len(candidate1_alternative_selected),
-            "candidate1ManualDesignCount": len(candidate1_manual_requested),
-            "candidate1KeptRejectedCount": len(candidate1_rejected),
-        },
+        "title": "Draft ISO 26262 Verification Support Report",
+        "summary": summary_metrics,
         "sections": sections,
+        "approvalGate": approval_gate,
+        "reportStatus": report_status,
+        "unresolvedIssues": unresolved_issues,
+        "aiMetadata": ai_metadata,
+        "auditLog": [audit_event],
     }
